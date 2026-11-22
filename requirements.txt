@@ -1,0 +1,6 @@
+# Inference versions verified together on Python 3.13.
+torch==2.11.0
+torchvision==0.26.0
+opencv-python==4.13.0.92
+numpy==2.4.4
+Pillow==12.2.0

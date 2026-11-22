@@ -1,0 +1,39 @@
+# Python environments and build artifacts
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Local secrets and editor state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.bak
+
+# Datasets, trained weights, generated media and logs
+data/
+datasets/
+outputs/
+runs/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.log
+
+# Jupyter runtime files
+.ipynb_checkpoints/
