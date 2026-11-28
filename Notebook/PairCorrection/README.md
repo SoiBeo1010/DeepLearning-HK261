@@ -6,17 +6,33 @@ không cần tải các file Python trong repo lên Kaggle.
 Kiến trúc: MobileNetV3-Small pretrained ImageNet → global classifier, kết hợp
 feature map trung gian với attention theo cặp và hiệu chỉnh logits có gate.
 Ba cặp được chọn từ validation của global-only pilot, cố định trước train chính.
-Không dùng test để chọn cặp hoặc tính class weights.
+Không dùng test để chọn cặp hoặc tính class weights. **Mặc định mới là global-only
+Cross-Entropy (`global_ce`)**, để xác lập chất lượng backbone trước khi thêm nhánh.
+
+## Thay đổi sau review run 60,57%
+
+- Backbone LR mặc định **1e-4** thay vì 3e-5; có `global_ce_lr3e5` để so riêng LR.
+- Pilot **15 epoch**, main **35 epoch**, tổng ngân sách vẫn 50 như các run trước.
+- Xếp cặp theo **trung bình 3 confusion cuối pilot**, thay vì một best pilot yếu
+  sau 5 epoch. Lưu score std/min/max, số lần vào top-k và Jaccard thứ hạng.
+- Báo cảnh báo nếu pilot cuối chưa đạt `pair_mining_min_accuracy=0.60` hoặc cặp
+  thiếu ổn định; vẫn chạy theo ngân sách cố định, không bảo đảm accuracy tốt.
+- Diagnostics gate/delta theo true class, chỉ dùng từng cặp và bỏ từng cặp.
+- Test mặc định **tắt**; thêm hỗ trợ ảnh 224 và lưu resolution vào checkpoint.
+
+Đây là các thử nghiệm để kiểm tra giả thuyết backbone chưa thích nghi và chọn
+cặp quá sớm. Chưa có kết quả FER2013 mới, không khẳng định sẽ tăng accuracy.
 
 ## Chạy trên Kaggle
 
 1. Import file `.ipynb`, gắn dataset `msambare/fer2013` có `train/` và `test/`.
 2. Bật GPU và Internet để tải ImageNet weights lần đầu. Khi offline, gắn file
    state dict torchvision MobileNetV3-Small và đặt `backbone_weights_path`.
-3. Giữ `EXPERIMENT = 'pair_balanced'` để thử kiến trúc kèm loss cân bằng lớp.
-4. Chạy lần lượt các cell: pilot 5 epoch → chọn cặp → train chính 45 epoch.
-5. Dùng validation để chọn cấu hình. Trong lúc so nhiều preset, đặt
-   `RUN_FINAL_TEST=False`; bật lại sau khi chốt để xuất kết quả test.
+3. Giữ **`EXPERIMENT = 'global_ce'`** cho lần thử tiếp theo.
+4. Chạy lần lượt: pilot 15 epoch → báo cáo xếp cặp → train chính 35 epoch.
+   Global-only không tạo nhánh cặp; bảng xếp hạng được lưu để tham khảo.
+5. Dùng validation để chọn cấu hình. `RUN_FINAL_TEST=False` là mặc định;
+   chỉ bật True sau khi chốt để xuất kết quả test.
 6. Tải `pair_correction_best_checkpoint.pth` trong thư mục in ở dòng `Output:`.
 
 Notebook mặc định một GPU cho model nhỏ. Có thể đặt `multi_gpu=True` để dùng
@@ -27,37 +43,61 @@ có thể làm kết quả khác một GPU, nên phải ghi thiết bị/cách c
 
 | Preset | Kiến trúc | Loss chính |
 |---|---|---|
-| `global_ce` | Chỉ global head | CE |
+| `global_ce` (mặc định) | Chỉ global head, backbone LR 1e-4 | CE |
+| `global_ce_lr3e5` | Chỉ global head, backbone LR 3e-5 | CE |
 | `pair_ce` | Cặp từ validation, có gate | CE |
 | `global_balanced` | Chỉ global head | Class-balanced CE |
 | `pair_balanced` | Cặp từ validation, có gate | Class-balanced CE |
 | `pair_no_gate` | Cùng nhánh cặp, gate=1 | Class-balanced CE |
 | `pair_random` | Cặp ngẫu nhiên, có gate | Class-balanced CE |
 
-Giữ split, pilot seed, train seed và ngân sách khi so preset. Mỗi run đều train
-pilot; không bỏ chi phí này khỏi thời gian tổng. Mặc định global-only có 931.047
-tham số, model 3 cặp có 933.805. Class-balanced loss dùng effective number, các
-đầu nhị phân có loss phụ cân bằng hai phía theo số mẫu train.
+Giữ split, pilot seed, train seed và ngân sách khi so preset. Hai preset LR dùng
+cùng lịch 15+35; không dùng run cũ 5+45 để quy kết riêng tác dụng của LR.
+Sau baseline, so `pair_ce` với `global_ce`, và `pair_balanced` với
+`global_balanced` để tách tác dụng nhánh. `pair_no_gate` so với `pair_balanced`
+giúp kiểm tra gate; `pair_random` kiểm tra cách chọn cặp.
+
+Mỗi run đều train pilot; không bỏ chi phí này khỏi thời gian tổng. Global-only
+có 931.047 tham số, model 3 cặp có 933.805. Class-balanced loss dùng effective
+number, các đầu nhị phân có loss phụ cân bằng hai phía theo số mẫu train.
 
 `pairs_file` có thể trỏ đến `pairs.json` của run trước để giữ cặp qua nhiều seed;
 notebook kiểm tra fingerprint split và thứ tự nhãn. Không resume weights hoặc
 optimizer bằng tùy chọn này. `mining_seed` giữ pilot/cặp ổn định khi đổi `seed`.
+
+`pair_mining_window=3` lấy ba epoch cuối theo thứ tự, chuẩn hóa confusion theo
+support từng lớp, trung bình score rồi xếp cặp. Best pilot checkpoint dùng để
+khởi tạo main có thể thuộc một epoch khác; hai lựa chọn này được ghi riêng.
+Thứ hạng ổn định không đồng nghĩa đã tìm đúng các cặp khó nhất sau main.
+
+Chọn `CFG.update(image_size=224)` sau khi áp dụng preset nếu muốn kiểm tra riêng
+độ phân giải; mặc định 112. Resize không sinh chi tiết mới. So accuracy và thời
+gian với cùng các yếu tố còn lại, không đồng thời thêm nhánh/loss.
 
 ## File kết quả
 
 - `run_config.json`, `training.json`, `model_config.json`: cấu hình thực chạy.
 - `split_manifest.csv`: ảnh train/validation; `class_weights.csv`: trọng số lớp.
 - `pairs.json`, `pilot_pair_ranking.csv`: cặp và nguồn chọn cặp.
+- `pilot_validation_snapshots.json`: confusion/metric của từng pilot epoch.
+- `pilot_mining_confusion_mean.csv`: confusion trung bình cửa sổ, có thể là số lẻ.
+- `pilot_pair_stability.csv`: overlap/Jaccard của từng epoch với top-k tổng hợp.
 - `pilot_history.csv`, `main_history.csv`: tách chi phí hai giai đoạn.
 - `pilot_global_best_checkpoint.pth`: best model giai đoạn pilot.
 - **`pair_correction_best_checkpoint.pth`**: weights kèm kiến trúc/cặp/tiền xử lý.
 - `pair_correction_best.pth`: chỉ raw state dict.
-- Báo cáo validation/test, predictions, confusion matrix và pair diagnostics.
+- Báo cáo validation/test, predictions có gate/delta từng ảnh, confusion matrix,
+  `*_pair_diagnostics.csv`, `*_pair_by_class.csv`.
 
 Diagnostics cho biết bao nhiêu dự đoán được hiệu chỉnh thành đúng hoặc thành sai.
+Có mean gate/delta trên toàn tập, chỉ các ảnh thuộc cặp, và theo từng nhãn thật.
+`only_pair_*` chỉ thêm cặp đó vào global logits. `marginal_*` so model cuối với
+model bỏ riêng cặp đó. Hai phép kiểm tra giữ feature/model weights cố định,
+không train lại; số đóng góp các cặp không cộng được như các phần độc lập.
 So global và final logits của cùng model chỉ là kiểm tra nội bộ, chưa thay thế
 run đối chứng global-only có cùng ngân sách. Nhánh vẫn được tính cho mọi ảnh;
 gate điều chỉnh ảnh hưởng chứ không bỏ qua tính toán.
+Global-only có final=global và các bảng pair diagnostics trống có header.
 
 Chạy lại cell tạo dữ liệu tạo thư mục run mới. Các phase đã có output không bị
 ghi đè khi chạy lại; tạo run mới để train lại. Checkpoint lưu best weights, không
@@ -69,14 +109,19 @@ with torch.inference_mode():
     logits = restored(tensor)['logits']
 ```
 
-Đầu vào phải là ảnh grayscale lặp 3 kênh, 112×112, chuẩn hóa ImageNet theo
-notebook. Các weights này chưa dùng trực tiếp với ứng dụng CCT cũ trong `src/fer`.
+Đầu vào phải là ảnh grayscale lặp 3 kênh, kích thước khớp checkpoint (mặc định
+112×112, có thể thử 224×224), chuẩn hóa ImageNet. Loader vẫn đọc checkpoint cũ
+không có `image_size` và mặc định chúng là 112. Các weights này chưa dùng trực
+tiếp với ứng dụng CCT cũ trong `src/fer`.
 
 ## Kiểm tra local
 
 Đã kiểm tra các công thức gate/hiệu chỉnh, gradient, loss nhị phân có MixUp,
-class weights, chọn cặp/fingerprint, checkpoint, và toàn bộ notebook với dữ liệu
-giả: 2 epoch pilot + 3 epoch chính trên CPU, thêm một run global-only.
+class weights, chọn cặp/fingerprint, checkpoint và cả hai độ phân giải 112/224.
+Kiểm tra ranking theo cửa sổ qua nhiều epoch, hỗ trợ snapshot cùng validation,
+gate/delta trên fixture có helpful/harmful biết trước, và toàn bộ notebook với
+dữ liệu giả: 2 epoch pilot + 3 epoch chính trên CPU; thêm run global-only theo
+mặc định mới với test bị giữ ngoài filesystem. Test không được đọc khi bị tắt.
 Không phải kết quả accuracy FER2013; CUDA/AMP thực tế cần chạy trên Kaggle.
 
 Để chạy lại kiểm tra từ môi trường có thư viện của dự án:

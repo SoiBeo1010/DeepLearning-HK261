@@ -14,6 +14,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 import nbformat
 import numpy as np
+import pandas as pd
 from PIL import Image
 import torch
 from torch import nn
@@ -39,11 +40,18 @@ for index, cell in enumerate(nb.cells):
         exec(compile(ast.Module(body=defs, type_ignores=[]), f'definitions_{index}', 'exec'), ns)
 
 cfg = copy.deepcopy(ns['CFG'])
-assert cfg['experiment'] == 'pair_balanced' and cfg['num_pairs'] == 3
+assert cfg['experiment'] == 'global_ce' and cfg['num_pairs'] == 3
+assert not cfg['use_pair_correction'] and not cfg['balanced_loss']
+assert cfg['backbone_lr'] == 1e-4 and cfg['pair_mining_window'] == 3
+assert cfg['pilot_epochs'] == 15 and cfg['main_epochs'] == 35
+assert ns['EXPERIMENT_PRESETS']['global_ce_lr3e5']['backbone_lr'] == 3e-5
 assert cfg['pilot_epochs'] + cfg['main_epochs'] == 50
+cfg.update(ns['EXPERIMENT_PRESETS']['pair_balanced'])
+cfg.update(experiment='pair_balanced', run_name='smoke_pair_balanced')
 cfg.update(pretrained=False, device='cpu', batch_size=7, pilot_epochs=2, main_epochs=3,
            pilot_warmup_epochs=0, main_warmup_epochs=1, use_amp=False,
-           num_workers=0, clean_train_max_samples=7, clean_train_every=1, validation_fraction=.25)
+           num_workers=0, clean_train_max_samples=7, clean_train_every=1, validation_fraction=.25,
+           pair_mining_window=2)
 device = torch.device('cpu')
 pairs = [[2,5],[4,5],[0,5]]
 counts = [10,2,12,30,15,18,8]
@@ -132,6 +140,23 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
     assert not any(key.startswith('module.') for key in payload['state_dict'])
     restored = ns['load_trained_model'](checkpoint,device)
     with torch.inference_mode(): torch.testing.assert_close(restored(sample)['logits'],expected)
+    legacy = copy.deepcopy(payload)
+    legacy['model_config'].pop('image_size')
+    torch.save(legacy,folder/'legacy112.pth')
+    legacy_restored = ns['load_trained_model'](folder/'legacy112.pth',device)
+    with torch.inference_mode(): torch.testing.assert_close(legacy_restored(sample)['logits'],expected)
+    large_cfg={**cfg,'image_size':224}
+    ns['validate_config'](large_cfg)
+    large_model=ns['build_model'](large_cfg,pairs).eval()
+    large_input=torch.randn(2,3,224,224)
+    with torch.inference_mode(): large_expected=large_model(large_input)['logits']
+    ns['save_checkpoint'](large_model,large_cfg,1,{'loss':1.,'accuracy':.6,'macro_f1':.5,'balanced_accuracy':.5},folder/'224.pth')
+    large_restored=ns['load_trained_model'](folder/'224.pth',device)
+    assert large_restored.image_size==224
+    with torch.inference_mode(): torch.testing.assert_close(large_restored(large_input)['logits'],large_expected)
+    try: large_restored(sample)
+    except ValueError: pass
+    else: raise AssertionError('Checkpoint resolution must be enforced.')
     damaged = copy.deepcopy(payload)
     damaged['state_dict']['pair_indices'][0,0]=1
     torch.save(damaged,folder/'damaged.pth')
@@ -145,18 +170,80 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
     ranking,matrix=ns['rank_confusion_pairs'](true,pred)
     assert (ranking[0]['i'],ranking[0]['j']) == (2,5)
     val={'targets':true,'predictions':pred}
-    selected,_=ns['choose_pairs'](cfg,val,'abc')
+    selected,_,_=ns['choose_pairs']({**cfg,'pair_mining_window':1},val,'abc')
     assert selected['pairs'][0]==[2,5] and len(selected['pairs'])==3
     pairfile=folder/'pairs.json';pairfile.write_text(json.dumps(selected),encoding='utf-8')
-    reused,_=ns['choose_pairs']({**cfg,'pairs_file':str(pairfile)},val,'abc')
+    reused,_,_=ns['choose_pairs']({**cfg,'pairs_file':str(pairfile)},val,'abc')
     assert reused['pairs']==selected['pairs']
     try: ns['choose_pairs']({**cfg,'pairs_file':str(pairfile)},val,'wrong')
     except ValueError: pass
     else: raise AssertionError('Wrong split pair artifact accepted.')
-    random1,_=ns['choose_pairs']({**cfg,'pair_selection':'random'},val,'abc')
-    random2,_=ns['choose_pairs']({**cfg,'pair_selection':'random'},val,'abc')
+    random1,_,_=ns['choose_pairs']({**cfg,'pair_selection':'random'},val,'abc')
+    random2,_,_=ns['choose_pairs']({**cfg,'pair_selection':'random'},val,'abc')
     assert random1['pairs']==random2['pairs']
     assert ns['choose_pairs']({**cfg,'use_pair_correction':False},val,'abc')[0]['pairs']==[]
+
+    # Old/early confusion must not influence ranking of the last two snapshots.
+    early=np.eye(7,dtype=int)*10;early[0,0]=0;early[0,1]=10;early[1,1]=0;early[1,0]=10
+    late1=np.eye(7,dtype=int)*10;late1[2,2]=4;late1[2,5]=6;late1[5,5]=5;late1[5,2]=5
+    late2=np.eye(7,dtype=int)*10;late2[2,2]=5;late2[2,5]=5;late2[5,5]=4;late2[5,2]=6
+    snapshots=[{'epoch':i+1,'accuracy':.58+i*.02,'confusion':matrix.tolist()} for i,matrix in enumerate([early,late1,late2])]
+    ranking,average,chosen,stability=ns['aggregate_pilot_rankings'](snapshots,2,3)
+    assert (ranking[0]['i'],ranking[0]['j'])==(2,5)
+    assert math.isclose(ranking[0]['score'],.55)
+    assert ranking[0]['top_k_count']==2 and chosen[0]['epoch']==2
+    np.testing.assert_array_equal(average,(late1+late2)/2)
+    assert all(row['jaccard_with_aggregate']==1 for row in stability)
+    selected_window,_,mining=ns['choose_pairs'](cfg,val,'abc',snapshots)
+    assert selected_window['pairs'][0]==[2,5]
+    assert selected_window['mining_epochs']==[2,3]
+    assert selected_window['source']=='pilot_validation_window'
+    try: ns['choose_pairs'](cfg,val,'abc')
+    except ValueError: pass
+    else: raise AssertionError('Window mining must not silently fall back to a single snapshot.')
+    wrong_support=copy.deepcopy(snapshots);wrong_support[-1]['confusion'][0][0]+=1
+    try: ns['aggregate_pilot_rankings'](wrong_support,2,3)
+    except ValueError: pass
+    else: raise AssertionError('Snapshot supports must match.')
+    low=copy.deepcopy(snapshots)
+    for row in low:row['accuracy']=.2
+    assert ns['choose_pairs'](cfg,val,'abc',low)[0]['warnings']
+    print('PASS: tail-window mining ignores early confusion, preserves support, exports stability and warns on a weak pilot.')
+
+    # Diagnostics must distinguish a helpful and harmful correction, per class.
+    class FixedCorrection(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer('pair_indices',torch.tensor([[0,1]]))
+            self.register_buffer('pair_incidence',torch.tensor([[1.,-1.,0,0,0,0,0]]))
+            self.register_buffer('z',torch.tensor([[0.,.2,-10,-10,-10,-10,-10],
+                                                 [.4,0.,-10,-10,-10,-10,-10],
+                                                 [.2,0.,-10,-10,-10,-10,-10],
+                                                 [0.,.2,-10,-10,-10,-10,-10]]))
+            self.register_buffer('g',torch.tensor([[.1],[.5],[.9],[.3]]))
+            self.register_buffer('d',torch.tensor([[5.],[-5.],[-3.],[3.]]))
+        def forward(self,inputs):
+            ix=inputs[:,0].long()
+            global_logits=self.z[ix];gates=self.g[ix];delta=self.d[ix]
+            return {'global_logits':global_logits,'gates':gates,'pair_logits':delta,
+                    'logits':global_logits+(gates*delta)@self.pair_incidence}
+    fixture_loader=[(torch.arange(4).float().unsqueeze(1),torch.tensor([0,1,0,1]))]
+    diagnostic_result=ns['evaluate'](FixedCorrection(),fixture_loader,device,cfg,collect_pair_details=True)
+    diagnostic_pairs,by_class=ns['pair_diagnostics'](diagnostic_result,[[0,1]])
+    row=diagnostic_pairs.iloc[0]
+    assert row.only_pair_helpful_all==2 and row.only_pair_harmful_all==2
+    assert row.only_pair_net_correct_all==0 and row.marginal_net_correct_all==0
+    assert math.isclose(row.mean_gate_on_pair,.45,abs_tol=1e-6)
+    assert row.remove_pair_accuracy_all==.5
+    assert len(by_class)==7 and by_class.samples.tolist()==[2,2,0,0,0,0,0]
+    assert math.isclose(by_class.iloc[0].mean_gate,.5,abs_tol=1e-6)
+    assert math.isclose(by_class.iloc[1].mean_delta,-1.,abs_tol=1e-6)
+    with patch('matplotlib.pyplot.show'):
+        ns['export_report'](diagnostic_result,folder,'fixture',[[0,1]])
+    predicted=pd.read_csv(folder/'fixture_predictions.csv')
+    assert predicted.pair_angry_disgust_gate.notna().all()
+    assert (folder/'fixture_pair_by_class.csv').is_file()
+    print('PASS: detailed gate/delta, helpful/harmful only-pair vs remove-pair diagnostics and conditional per-class summaries.')
 
     root=folder/'data'
     for split,count in [('train',4),('test',1)]:
@@ -187,7 +274,11 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
             if 'final_evaluation' in cell.metadata.get('tags',[]):
                 (root/'held_out').rename(root/'test')
                 test_reached=True
-            exec(compile(cell.source,f'run_all_cell_{i}','exec'),run)
+            source=cell.source
+            if 'final_evaluation' in cell.metadata.get('tags',[]):
+                assert 'RUN_FINAL_TEST = False' in source
+                source=source.replace('RUN_FINAL_TEST = False','RUN_FINAL_TEST = True')
+            exec(compile(source,f'run_all_cell_{i}','exec'),run)
             if 'configuration' in cell.metadata.get('tags',[]):
                 run['CFG'].update(cfg)
                 run['CFG']['data_dir']=str(root)
@@ -202,7 +293,12 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
     metadata=json.loads((run_dir/'training.json').read_text())
     assert metadata['parameter_count']==933805
     assert metadata['class_counts']==[3]*7
-    assert metadata['pair_info']['source']=='pilot_validation_confusion'
+    assert metadata['pair_info']['source']=='pilot_validation_window'
+    assert metadata['pair_info']['mining_epochs']==[1,2]
+    snapshots_saved=json.loads((run_dir/'pilot_validation_snapshots.json').read_text())
+    assert len(snapshots_saved)==2
+    ranking_csv=pd.read_csv(run_dir/'pilot_pair_ranking.csv')
+    assert 'top_k_count' in ranking_csv and 'score_std' in ranking_csv
     best=json.loads((run_dir/'main_best_validation.json').read_text())
     assert best['accuracy']==run['history'].val_accuracy.max()
     saved=torch.load(run_dir/'pair_correction_best_checkpoint.pth',map_location='cpu',weights_only=True)
@@ -213,9 +309,35 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
     for artifact in ['pairs.json','pilot_pair_ranking.csv','pilot_validation_confusion.csv','class_weights.csv',
                      'main_history.csv','pilot_history.csv','training.json','model_config.json','split_manifest.csv',
                      'validation_predictions.csv','validation_pair_diagnostics.csv','test_report.txt','test_confusion.png',
-                     'test_metrics.json','test_predictions.csv','training_history.png']:
+                     'test_metrics.json','test_predictions.csv','training_history.png',
+                     'pilot_pair_stability.csv','pilot_mining_confusion_mean.csv',
+                     'validation_pair_by_class.csv','test_pair_by_class.csv']:
         assert (run_dir/artifact).is_file(),artifact
     print('PASS: entire notebook executed in order, 2 pilot + 3 main epochs, frozen validation-mined pairs, strict pilot transfer, reports and test.')
+
+    # Default global_ce must finish Run All without consulting a test directory.
+    (root/'test').rename(root/'held_out_again')
+    default_run={'__name__':'__default_global_ce_smoke__'}
+    default_cfg={**cfg,**ns['EXPERIMENT_PRESETS']['global_ce'],
+                 'experiment':'global_ce','run_name':'smoke_global_ce',
+                 'main_epochs':2,'main_warmup_epochs':0}
+    with patch('matplotlib.pyplot.show'):
+        for i,cell in enumerate(nb.cells):
+            if cell.cell_type!='code':continue
+            exec(compile(cell.source,f'default_cell_{i}','exec'),default_run)
+            if 'configuration' in cell.metadata.get('tags',[]):
+                default_run['CFG'].update(default_cfg)
+                default_run['CFG']['data_dir']=str(root)
+                default_run['CFG']['output_root']=str(folder/'default_outputs')
+                default_run['DEVICE']=device
+    assert default_run['PAIRS']==[] and len(default_run['pilot_history'])==2
+    assert len(default_run['history'])==2 and (default_run['history'].pair_loss==0).all()
+    assert 'test_result' not in default_run
+    assert not (default_run['RUN_DIR']/'test_metrics.json').exists()
+    default_predictions=pd.read_csv(default_run['RUN_DIR']/'validation_predictions.csv')
+    assert (default_predictions.prediction==default_predictions.global_prediction).all()
+    assert pd.read_csv(default_run['RUN_DIR']/'validation_pair_diagnostics.csv').empty
+    print('PASS: default global_ce Run All completes without any test directory, produces no test output and needs no pair branch.')
 
     # A global-only run must use no auxiliary branch and no pair-loss terms.
     global_cfg={**cfg,**ns['EXPERIMENT_PRESETS']['global_balanced'],'main_epochs':2,'main_warmup_epochs':0}
