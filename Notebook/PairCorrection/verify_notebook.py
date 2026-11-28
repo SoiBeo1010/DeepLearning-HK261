@@ -41,11 +41,12 @@ for index, cell in enumerate(nb.cells):
         exec(compile(ast.Module(body=defs, type_ignores=[]), f'definitions_{index}', 'exec'), ns)
 
 cfg = copy.deepcopy(ns['CFG'])
-assert cfg['experiment'] == 'global_ce_224' and cfg['num_pairs'] == 3
-assert cfg['image_size'] == 224 and cfg['head_type'] == 'linear' and cfg['mixup_probability'] == .3
+assert cfg['experiment'] == 'global_ce_224_mixup50' and cfg['num_pairs'] == 3
+assert cfg['image_size'] == 224 and cfg['head_type'] == 'linear' and cfg['mixup_probability'] == .5
 assert not cfg['use_pair_correction'] and not cfg['balanced_loss']
 assert cfg['backbone_lr'] == 1e-4 and cfg['pair_mining_window'] == 3
 assert cfg['pilot_epochs'] == 15 and cfg['main_epochs'] == 35
+assert cfg['main_early_stop_patience'] == 7
 assert ns['EXPERIMENT_PRESETS']['global_ce_lr3e5']['backbone_lr'] == 3e-5
 assert cfg['pilot_epochs'] + cfg['main_epochs'] == 50
 assert ns['tqdm'].__module__ == 'tqdm.std'
@@ -53,8 +54,22 @@ baseline_preset=ns['EXPERIMENT_PRESETS']['global_ce']
 assert {k for k in baseline_preset if baseline_preset[k]!=ns['EXPERIMENT_PRESETS']['global_ce_224'][k]}=={'image_size'}
 assert {k for k in baseline_preset if baseline_preset[k]!=ns['EXPERIMENT_PRESETS']['global_ce_pretrained_head'][k]}=={'head_type'}
 assert {k for k in baseline_preset if baseline_preset[k]!=ns['EXPERIMENT_PRESETS']['global_ce_mixup50'][k]}=={'mixup_probability'}
+preset_224 = ns['EXPERIMENT_PRESETS']['global_ce_224']
+for name, key, value in [
+    ('global_ce_224_mixup50', 'mixup_probability', .5),
+    ('global_balanced_224', 'balanced_loss', True),
+    ('pair_ce_224', 'use_pair_correction', True),
+]:
+    assert ns['EXPERIMENT_PRESETS'][name] == {**preset_224, key: value}
 for preset in ns['EXPERIMENT_PRESETS'].values():
     ns['validate_config']({**cfg,**preset})
+for invalid_patience in (-1, 1.5, True):
+    try:
+        ns['validate_config']({**cfg, 'main_early_stop_patience': invalid_patience})
+    except ValueError as exc:
+        assert 'main_early_stop_patience' in str(exc)
+    else:
+        raise AssertionError('Invalid early-stop patience accepted.')
 try:ns['validate_config']({**cfg,'head_type':'unsupported'})
 except ValueError:pass
 else:raise AssertionError('Unknown classifier type accepted.')
@@ -422,9 +437,12 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
         data,labels=next(iter(loader));assert data.shape[1:]==(3,112,112)
     print('PASS: normalized confusion ranking, reproducible random/reused pairs, fingerprint guard, fixed split and no test reads.')
 
-    # Execute every cell in order, including pair mining and full pilot/main train.
+    # Execute every cell in order for the 224 CE pair preset, including mining and training.
     # Test stays physically absent until the final evaluation cell.
     run={'__name__':'__pair_run_all__'}
+    pair_cfg = {**cfg, **ns['EXPERIMENT_PRESETS']['pair_ce_224'],
+                'experiment': 'pair_ce_224', 'run_name': 'smoke_pair_ce_224',
+                'main_early_stop_patience': 0}
     test_reached=False
     with patch('matplotlib.pyplot.show'):
         for i,cell in enumerate(nb.cells):
@@ -438,7 +456,7 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
                 source=source.replace('RUN_FINAL_TEST = False','RUN_FINAL_TEST = True')
             exec(compile(source,f'run_all_cell_{i}','exec'),run)
             if 'configuration' in cell.metadata.get('tags',[]):
-                run['CFG'].update(cfg)
+                run['CFG'].update(pair_cfg)
                 run['CFG']['data_dir']=str(root)
                 run['CFG']['output_root']=str(folder/'outputs')
                 run['DEVICE']=device
@@ -450,13 +468,16 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
     run_dir=run['RUN_DIR']
     metadata=json.loads((run_dir/'training.json').read_text())
     assert metadata['parameter_count']==933805
+    assert metadata['model_config']['image_size']==224 and not metadata['config']['balanced_loss']
+    assert metadata['main_training']=={'planned_epochs':3,'completed_epochs':3,'stopped_early':False}
     assert metadata['class_counts']==[3]*7
     assert metadata['pair_info']['source']=='pilot_validation_window'
     assert metadata['pair_info']['mining_epochs']==[1,2]
     snapshots_saved=json.loads((run_dir/'pilot_validation_snapshots.json').read_text())
     assert len(snapshots_saved)==2
     ranking_csv=pd.read_csv(run_dir/'pilot_pair_ranking.csv')
-    assert 'top_k_count' in ranking_csv and 'score_std' in ranking_csv
+    assert {'rank', 'top_k_count', 'score_std'} <= set(ranking_csv.columns)
+    assert ranking_csv['rank'].tolist() == list(range(1, 22))
     best=json.loads((run_dir/'main_best_validation.json').read_text())
     assert best['accuracy']==run['history'].val_accuracy.max()
     saved=torch.load(run_dir/'pair_correction_best_checkpoint.pth',map_location='cpu',weights_only=True)
@@ -473,11 +494,11 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
         assert (run_dir/artifact).is_file(),artifact
     print('PASS: entire notebook executed in order, 2 pilot + 3 main epochs, frozen validation-mined pairs, strict pilot transfer, reports and test.')
 
-    # Default global_ce_224 must finish Run All with its actual resolution and no test directory.
+    # Default MixUp preset must finish Run All with its actual resolution and no test directory.
     (root/'test').rename(root/'held_out_again')
     default_run={'__name__':'__default_global_ce_smoke__'}
-    default_cfg={**cfg,**ns['EXPERIMENT_PRESETS']['global_ce_224'],
-                 'experiment':'global_ce_224','run_name':'smoke_global_ce_224',
+    default_cfg={**cfg,**ns['EXPERIMENT_PRESETS'][ns['EXPERIMENT']],
+                 'experiment':ns['EXPERIMENT'],'run_name':'smoke_global_ce_224_mixup50',
                  'main_epochs':2,'main_warmup_epochs':0}
     with patch('matplotlib.pyplot.show'):
         for i,cell in enumerate(nb.cells):
@@ -492,13 +513,14 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
     assert default_run['model'].image_size==224
     default_metadata=json.loads((default_run['RUN_DIR']/'training.json').read_text())
     assert default_metadata['model_config']['image_size']==224 and default_metadata['model_config']['head_type']=='linear'
+    assert default_metadata['config']['mixup_probability']==.5
     assert len(default_run['history'])==2 and (default_run['history'].pair_loss==0).all()
     assert 'test_result' not in default_run
     assert not (default_run['RUN_DIR']/'test_metrics.json').exists()
     default_predictions=pd.read_csv(default_run['RUN_DIR']/'validation_predictions.csv')
     assert (default_predictions.prediction==default_predictions.global_prediction).all()
     assert pd.read_csv(default_run['RUN_DIR']/'validation_pair_diagnostics.csv').empty
-    print('PASS: default global_ce_224 Run All completes at 224 with no test directory and no pair branch.')
+    print('PASS: default 224 MixUp .5 Run All completes with no test directory and no pair branch.')
 
     # Combined option exercises real pilot/main training at 224 with the retained head,
     # and probability .5 (the numeric MixUp labels are checked below).
@@ -546,24 +568,39 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
         assert outcome['accuracy']==expected_accuracy and beta.called==should_mix
     print('PASS: MixUp probability .5 activates only selected batches and preserves weighted two-label accuracy.')
 
-    # A global-only run must use no auxiliary branch and no pair-loss terms.
-    global_cfg={**cfg,**ns['EXPERIMENT_PRESETS']['global_balanced'],'main_epochs':2,'main_warmup_epochs':0}
+    # Use a controlled validation sequence while training the balanced 224 preset.
+    # Macro F1 breaks the accuracy tie at epoch 2 and resets patience.
+    global_cfg={**cfg,**ns['EXPERIMENT_PRESETS']['global_balanced_224'],
+                'main_epochs':6,'main_warmup_epochs':0,'main_early_stop_patience':2,'clean_train_every':10}
     pilot=ns['load_trained_model'](run_dir/'pilot_global_best_checkpoint.pth',device)
     global_model=ns['build_model'](global_cfg,[])
-    global_model.features.load_state_dict(pilot.features.state_dict(),strict=True)
-    global_model.global_classifier.load_state_dict(pilot.global_classifier.state_dict(),strict=True)
+    ns['transfer_global_state'](pilot,global_model)
+    global_loaders=default_run['loaders']
+    validation_scores=iter([(.5,.4),(.5,.45),(.49,.6),(.5,.45)])
+
+    def controlled_evaluate(model, loader, device, cfg):
+        accuracy, macro_f1 = next(validation_scores) if loader is global_loaders['val'] else (.9,.9)
+        return {'loss':1.,'accuracy':accuracy,'macro_f1':macro_f1,'balanced_accuracy':accuracy}
+
     global_run=folder/'global_run';global_run.mkdir()
-    global_model,global_history=ns['run_phase'](global_model,global_cfg,loaders,[3]*7,global_run,device,'main')
+    with patch.dict(ns, {'evaluate': controlled_evaluate}):
+        global_model,global_history=ns['run_phase'](global_model,global_cfg,global_loaders,[3]*7,global_run,device,'main')
+    assert global_history.epoch.tolist()==[1,2,3,4]
+    assert global_history.clean_train_accuracy.dropna().tolist()==[.9]
+    assert json.loads((global_run/'main_best_validation.json').read_text())['epoch']==2
+    for epoch, lr in enumerate(global_history.lr_backbone):
+        expected = global_cfg['backbone_lr'] * ns['lr_multiplier'](epoch, 6, 0, global_cfg['min_lr_ratio'])
+        assert math.isclose(lr, expected)
     assert (global_history.pair_loss==0).all()
     assert sum(p.numel() for p in global_model.parameters())==931047
     assert global_model.pair_indices.shape==(0,2)
     try:
-        ns['run_phase'](global_model,global_cfg,loaders,[3]*7,global_run,device,'main')
+        ns['run_phase'](global_model,global_cfg,global_loaders,[3]*7,global_run,device,'main')
     except FileExistsError:
         pass
     else:
         raise AssertionError('An existing run must not be overwritten by rerunning a phase.')
-    print('PASS: global-only balanced preset train/export path has 931,047 parameters and zero pair auxiliary.')
+    print('PASS: balanced 224 preset, validation tie-break, patience reset, nominal LR schedule and zero pair auxiliary.')
 
 assert all(hashlib.sha256(p.read_bytes()).hexdigest()==value for p,value in protected.items())
 print('ALL AVAILABLE PAIR-CORRECTION CHECKS PASSED. Prior notebooks unchanged; FER2013/GPU accuracy not measured locally.')

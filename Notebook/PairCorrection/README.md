@@ -3,26 +3,25 @@
 [Notebook để import vào Kaggle](fer2013-pair-correction-kaggle.ipynb) chạy độc lập,
 không cần tải các file Python trong repo lên Kaggle.
 
-Kiến trúc: MobileNetV3-Small pretrained ImageNet → global classifier, kết hợp
+Kiến trúc MobileNetV3-Small pretrained ImageNet → global classifier, kết hợp
 feature map trung gian với attention theo cặp và hiệu chỉnh logits có gate.
 Ba cặp được chọn từ validation của global-only pilot, cố định trước train chính.
-Không dùng test để chọn cặp hoặc tính class weights. **Mặc định mới là
-`global_ce_224`**: chỉ đổi ảnh lên 224×224, giữ global-only Cross-Entropy và
-classifier Linear như mốc `global_ce` 112×112 đạt best validation 63,71%.
+Baseline `global_ce_224` đạt **67,40% accuracy và 63,94% Macro F1** trên
+validation, **67,05% accuracy và 64,36% Macro F1** trên test. Baseline 112×112
+đạt 63,71% validation accuracy và 60,17% Macro F1.
 
-## Thí nghiệm tiếp theo sau run global-only 63,71%
+## Thí nghiệm ở 224×224
 
-- **A — `global_ce_224`:** chỉ đổi ảnh 112→224, vẫn 931.047 tham số.
-- **B — `global_ce_pretrained_head`:** giữ ảnh 112, dùng Linear 576→1024 đã
-  pretrained + Hardswish → Dropout → Linear 1024→7 mới, tổng 1.525.031 tham số.
-- **C — `global_ce_224_pretrained_head`:** kết hợp sau khi đánh giá riêng A/B.
-- **`global_ce_mixup50`:** chỉ tăng xác suất MixUp 0,3→0,5 trên mốc 112,
-  giữ alpha 0,1, dropout, erasing và weight decay.
-- **`global_ce_224_pretrained_head_mixup50`:** có sẵn để kiểm tra MixUp trên
-  cấu hình kết hợp; không chạy gộp tất cả ngay rồi quy kết tác dụng từng yếu tố.
-- Thanh tiến độ dùng **`from tqdm import tqdm`**, không phụ thuộc Jupyter widget.
+- **`global_ce_224_mixup50` (mặc định)** tăng xác suất MixUp ở main từ 0,30
+  lên 0,50, giữ alpha 0,10 và classifier Linear 576→7.
+- **`global_balanced_224`** bật class-balanced CE, giữ MixUp 0,30. Đọc thêm
+  precision và recall của `fear` và `disgust` trong báo cáo validation.
+- **`pair_ce_224`** bật nhánh cặp, giữ CE chính thường và MixUp 0,30.
+  So với `global_ce_224` trên cùng split, pilot và seed. Báo cáo validation
+  có số dự đoán được sửa đúng và bị sửa sai.
 
-Lớp ẩn giữ chính weights/bias từ torchvision classifier gốc, không reset.
+Các preset classifier pretrained vẫn có sẵn để thử lớp ẩn Linear 576→1024
+với Hardswish. Lớp ẩn giữ weights/bias từ torchvision classifier gốc.
 Từ pilot sang main copy strict cả features, projection và classifier. Projection
 pretrained dùng LR backbone 1e-4, classifier 7 nhãn và nhánh mới dùng LR 3e-4.
 Nếu `pretrained=False`, cùng cấu trúc `pretrained_mlp` khởi tạo ngẫu nhiên;
@@ -33,27 +32,30 @@ metadata ghi rõ để không báo cáo nhầm là pretrained.
 Classifier lớn hơn có thể overfit. Các preset là thí nghiệm cần đo trên Kaggle,
 chưa có kết quả accuracy mới. Cache giữ ảnh gốc nên vẫn dùng lại khi đổi preset.
 
-## Thiết lập giữ từ lần review trước
+## Lịch train và chọn cặp
 
 - Backbone LR mặc định **1e-4** thay vì 3e-5; có `global_ce_lr3e5` để so riêng LR.
-- Pilot **15 epoch**, main **35 epoch**, tổng ngân sách vẫn 50 như các run trước.
+- Pilot **15 epoch**, main **tối đa 35 epoch**. Mặc định main dừng sau 7 epoch
+  liên tiếp thiếu cải thiện validation accuracy, dùng Macro F1 để phân xử khi
+  accuracy bằng nhau. Lịch cosine vẫn tính trên 35 epoch. Đặt
+  `CFG.update(main_early_stop_patience=0)` để train đủ 35 epoch như baseline đã đo.
 - Xếp cặp theo **trung bình 3 confusion cuối pilot**, thay vì một best pilot yếu
   sau 5 epoch. Lưu score std/min/max, số lần vào top-k và Jaccard thứ hạng.
+  Notebook in riêng hạng và độ ổn định của `fear ↔ sad` và `neutral ↔ sad`.
 - Báo cảnh báo nếu pilot cuối chưa đạt `pair_mining_min_accuracy=0.60` hoặc cặp
-  thiếu ổn định; vẫn chạy theo ngân sách cố định, không bảo đảm accuracy tốt.
+  thiếu ổn định.
 - Diagnostics gate/delta theo true class, chỉ dùng từng cặp và bỏ từng cặp.
-- Test mặc định **tắt**; thêm hỗ trợ ảnh 224 và lưu resolution vào checkpoint.
+- Test mặc định **tắt**. Checkpoint lưu độ phân giải thực chạy.
 
-Đây là các thử nghiệm để kiểm tra giả thuyết backbone chưa thích nghi và chọn
-cặp quá sớm. Chưa có kết quả FER2013 mới, không khẳng định sẽ tăng accuracy.
+Các preset mới cần được đánh giá trên FER2013 ở Kaggle.
 
 ## Chạy trên Kaggle
 
 1. Import file `.ipynb`, gắn dataset `msambare/fer2013` có `train/` và `test/`.
 2. Bật GPU và Internet để tải ImageNet weights lần đầu. Khi offline, gắn file
    state dict torchvision MobileNetV3-Small và đặt `backbone_weights_path`.
-3. Giữ **`EXPERIMENT = 'global_ce_224'`** để chạy thử nghiệm A tiếp theo.
-4. Chạy lần lượt: pilot 15 epoch → báo cáo xếp cặp → train chính 35 epoch.
+3. Giữ **`EXPERIMENT = 'global_ce_224_mixup50'`** để thử MixUp 0,50.
+4. Chạy lần lượt pilot 15 epoch → báo cáo xếp cặp → train chính tối đa 35 epoch.
    Global-only không tạo nhánh cặp; bảng xếp hạng được lưu để tham khảo.
 5. Dùng validation để chọn cấu hình. `RUN_FINAL_TEST=False` là mặc định;
    chỉ bật True sau khi chốt để xuất kết quả test.
@@ -68,7 +70,10 @@ có thể làm kết quả khác một GPU, nên phải ghi thiết bị/cách c
 | Preset | Ảnh | Head sau pooling | MixUp p | Loss chính |
 |---|---:|---|---:|---|
 | `global_ce` | 112 | Linear 576→7 | 0,3 | CE |
-| **`global_ce_224` (mặc định)** | 224 | Linear 576→7 | 0,3 | CE |
+| `global_ce_224` | 224 | Linear 576→7 | 0,3 | CE |
+| **`global_ce_224_mixup50` (mặc định)** | 224 | Linear 576→7 | 0,5 | CE |
+| `global_balanced_224` | 224 | Linear 576→7 | 0,3 | Class-balanced CE |
+| `pair_ce_224` | 224 | Linear + cặp, có gate | 0,3 | CE |
 | `global_ce_pretrained_head` | 112 | Giữ Linear 576→1024 pretrained + 7 nhãn mới | 0,3 | CE |
 | `global_ce_224_pretrained_head` | 224 | Giữ lớp ẩn pretrained | 0,3 | CE |
 | `global_ce_mixup50` | 112 | Linear 576→7 | 0,5 | CE |
@@ -80,11 +85,11 @@ có thể làm kết quả khác một GPU, nên phải ghi thiết bị/cách c
 | `pair_no_gate` | 112 | Linear + cặp, gate=1 | 0,3 | Class-balanced CE |
 | `pair_random` | 112 | Linear + cặp ngẫu nhiên | 0,3 | Class-balanced CE |
 
-Giữ split, pilot seed, train seed và ngân sách khi so preset. Hai preset LR dùng
-cùng lịch 15+35; không dùng run cũ 5+45 để quy kết riêng tác dụng của LR.
-Sau baseline, so `pair_ce` với `global_ce`, và `pair_balanced` với
-`global_balanced` để tách tác dụng nhánh. `pair_no_gate` so với `pair_balanced`
-giúp kiểm tra gate; `pair_random` kiểm tra cách chọn cặp.
+Giữ split, pilot seed, train seed, lịch LR và patience khi so preset.
+Đối chứng từng preset 224 mới với `global_ce_224`. Ở 112×112, so
+`pair_ce` với `global_ce`, và `pair_balanced` với `global_balanced`
+để đo tác dụng nhánh. `pair_no_gate` so với `pair_balanced` giúp kiểm tra
+gate. `pair_random` kiểm tra cách chọn cặp.
 
 Mỗi run đều train pilot; không bỏ chi phí này khỏi thời gian tổng.
 
@@ -146,6 +151,7 @@ split, model hoặc input sau transform; chưa đo mức tăng tốc trên Kaggl
 ## File kết quả
 
 - `run_config.json`, `training.json`, `model_config.json`: cấu hình thực chạy.
+  `training.json` ghi số epoch main đã chạy, ngân sách và trạng thái dừng sớm.
 - `split_manifest.csv`: ảnh train/validation; `class_weights.csv`: trọng số lớp.
 - `pairs.json`, `pilot_pair_ranking.csv`: cặp và nguồn chọn cặp.
 - `pilot_validation_snapshots.json`: confusion/metric của từng pilot epoch.
@@ -189,9 +195,11 @@ Các weights này chưa dùng trực tiếp với ứng dụng CCT cũ trong `sr
 Đã kiểm tra các công thức gate/hiệu chỉnh, gradient, loss nhị phân có MixUp,
 class weights, chọn cặp/fingerprint, checkpoint và cả hai độ phân giải 112/224.
 Kiểm tra ranking theo cửa sổ qua nhiều epoch, hỗ trợ snapshot cùng validation,
-gate/delta trên fixture có helpful/harmful biết trước, và toàn bộ notebook với
-dữ liệu giả: 2 epoch pilot + 3 epoch chính trên CPU; thêm run global-only theo
-mặc định mới với test bị giữ ngoài filesystem. Test không được đọc khi bị tắt.
+gate/delta trên fixture có helpful/harmful biết trước, và toàn bộ notebook
+`pair_ce_224` với dữ liệu giả trên CPU. Preset MixUp mặc định đã chạy đủ các
+cell khi thư mục test vắng mặt. Kiểm tra riêng early stopping của
+`global_balanced_224`, gồm Macro F1 khi accuracy bằng nhau, bộ đếm patience
+và lịch cosine theo ngân sách ban đầu.
 Kiểm tra cache gồm hàng đợi không bị chặn bởi file chậm, pixel/augmentation
 giống nguồn, bản PIL độc lập, pack disk/RAM reuse không decode lại nguồn,
 cache hỏng được dựng lại, budget/fallback và đóng thread khi lỗi/dừng sớm.
