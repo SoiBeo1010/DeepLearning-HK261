@@ -6,10 +6,34 @@ không cần tải các file Python trong repo lên Kaggle.
 Kiến trúc: MobileNetV3-Small pretrained ImageNet → global classifier, kết hợp
 feature map trung gian với attention theo cặp và hiệu chỉnh logits có gate.
 Ba cặp được chọn từ validation của global-only pilot, cố định trước train chính.
-Không dùng test để chọn cặp hoặc tính class weights. **Mặc định mới là global-only
-Cross-Entropy (`global_ce`)**, để xác lập chất lượng backbone trước khi thêm nhánh.
+Không dùng test để chọn cặp hoặc tính class weights. **Mặc định mới là
+`global_ce_224`**: chỉ đổi ảnh lên 224×224, giữ global-only Cross-Entropy và
+classifier Linear như mốc `global_ce` 112×112 đạt best validation 63,71%.
 
-## Thay đổi sau review run 60,57%
+## Thí nghiệm tiếp theo sau run global-only 63,71%
+
+- **A — `global_ce_224`:** chỉ đổi ảnh 112→224, vẫn 931.047 tham số.
+- **B — `global_ce_pretrained_head`:** giữ ảnh 112, dùng Linear 576→1024 đã
+  pretrained + Hardswish → Dropout → Linear 1024→7 mới, tổng 1.525.031 tham số.
+- **C — `global_ce_224_pretrained_head`:** kết hợp sau khi đánh giá riêng A/B.
+- **`global_ce_mixup50`:** chỉ tăng xác suất MixUp 0,3→0,5 trên mốc 112,
+  giữ alpha 0,1, dropout, erasing và weight decay.
+- **`global_ce_224_pretrained_head_mixup50`:** có sẵn để kiểm tra MixUp trên
+  cấu hình kết hợp; không chạy gộp tất cả ngay rồi quy kết tác dụng từng yếu tố.
+- Thanh tiến độ dùng **`from tqdm import tqdm`**, không phụ thuộc Jupyter widget.
+
+Lớp ẩn giữ chính weights/bias từ torchvision classifier gốc, không reset.
+Từ pilot sang main copy strict cả features, projection và classifier. Projection
+pretrained dùng LR backbone 1e-4, classifier 7 nhãn và nhánh mới dùng LR 3e-4.
+Nếu `pretrained=False`, cùng cấu trúc `pretrained_mlp` khởi tạo ngẫu nhiên;
+metadata ghi rõ để không báo cáo nhầm là pretrained.
+
+Ảnh 112 tạo feature sâu 4×4, ảnh 224 tạo 7×7. Resize không sinh chi tiết mới từ
+ảnh gốc 48×48; độ phân giải lớn hơn tăng chi phí và chưa chắc tăng accuracy.
+Classifier lớn hơn có thể overfit. Các preset là thí nghiệm cần đo trên Kaggle,
+chưa có kết quả accuracy mới. Cache giữ ảnh gốc nên vẫn dùng lại khi đổi preset.
+
+## Thiết lập giữ từ lần review trước
 
 - Backbone LR mặc định **1e-4** thay vì 3e-5; có `global_ce_lr3e5` để so riêng LR.
 - Pilot **15 epoch**, main **35 epoch**, tổng ngân sách vẫn 50 như các run trước.
@@ -28,7 +52,7 @@ cặp quá sớm. Chưa có kết quả FER2013 mới, không khẳng định s�
 1. Import file `.ipynb`, gắn dataset `msambare/fer2013` có `train/` và `test/`.
 2. Bật GPU và Internet để tải ImageNet weights lần đầu. Khi offline, gắn file
    state dict torchvision MobileNetV3-Small và đặt `backbone_weights_path`.
-3. Giữ **`EXPERIMENT = 'global_ce'`** cho lần thử tiếp theo.
+3. Giữ **`EXPERIMENT = 'global_ce_224'`** để chạy thử nghiệm A tiếp theo.
 4. Chạy lần lượt: pilot 15 epoch → báo cáo xếp cặp → train chính 35 epoch.
    Global-only không tạo nhánh cặp; bảng xếp hạng được lưu để tham khảo.
 5. Dùng validation để chọn cấu hình. `RUN_FINAL_TEST=False` là mặc định;
@@ -41,15 +65,20 @@ có thể làm kết quả khác một GPU, nên phải ghi thiết bị/cách c
 
 ## Cấu hình đối chứng
 
-| Preset | Kiến trúc | Loss chính |
-|---|---|---|
-| `global_ce` (mặc định) | Chỉ global head, backbone LR 1e-4 | CE |
-| `global_ce_lr3e5` | Chỉ global head, backbone LR 3e-5 | CE |
-| `pair_ce` | Cặp từ validation, có gate | CE |
-| `global_balanced` | Chỉ global head | Class-balanced CE |
-| `pair_balanced` | Cặp từ validation, có gate | Class-balanced CE |
-| `pair_no_gate` | Cùng nhánh cặp, gate=1 | Class-balanced CE |
-| `pair_random` | Cặp ngẫu nhiên, có gate | Class-balanced CE |
+| Preset | Ảnh | Head sau pooling | MixUp p | Loss chính |
+|---|---:|---|---:|---|
+| `global_ce` | 112 | Linear 576→7 | 0,3 | CE |
+| **`global_ce_224` (mặc định)** | 224 | Linear 576→7 | 0,3 | CE |
+| `global_ce_pretrained_head` | 112 | Giữ Linear 576→1024 pretrained + 7 nhãn mới | 0,3 | CE |
+| `global_ce_224_pretrained_head` | 224 | Giữ lớp ẩn pretrained | 0,3 | CE |
+| `global_ce_mixup50` | 112 | Linear 576→7 | 0,5 | CE |
+| `global_ce_224_pretrained_head_mixup50` | 224 | Giữ lớp ẩn pretrained | 0,5 | CE |
+| `global_ce_lr3e5` | 112 | Linear, backbone LR 3e-5 | 0,3 | CE |
+| `pair_ce` | 112 | Linear + cặp, có gate | 0,3 | CE |
+| `global_balanced` | 112 | Linear | 0,3 | Class-balanced CE |
+| `pair_balanced` | 112 | Linear + cặp, có gate | 0,3 | Class-balanced CE |
+| `pair_no_gate` | 112 | Linear + cặp, gate=1 | 0,3 | Class-balanced CE |
+| `pair_random` | 112 | Linear + cặp ngẫu nhiên | 0,3 | Class-balanced CE |
 
 Giữ split, pilot seed, train seed và ngân sách khi so preset. Hai preset LR dùng
 cùng lịch 15+35; không dùng run cũ 5+45 để quy kết riêng tác dụng của LR.
@@ -57,8 +86,14 @@ Sau baseline, so `pair_ce` với `global_ce`, và `pair_balanced` với
 `global_balanced` để tách tác dụng nhánh. `pair_no_gate` so với `pair_balanced`
 giúp kiểm tra gate; `pair_random` kiểm tra cách chọn cặp.
 
-Mỗi run đều train pilot; không bỏ chi phí này khỏi thời gian tổng. Global-only
-có 931.047 tham số, model 3 cặp có 933.805. Class-balanced loss dùng effective
+Mỗi run đều train pilot; không bỏ chi phí này khỏi thời gian tổng.
+
+| Head | Global-only | Có 3 cặp |
+|---|---:|---:|
+| Linear | 931.047 | 933.805 |
+| Giữ lớp ẩn pretrained | 1.525.031 | 1.527.789 |
+
+Số tham số không thay đổi khi đổi 112→224. Class-balanced loss dùng effective
 number, các đầu nhị phân có loss phụ cân bằng hai phía theo số mẫu train.
 
 `pairs_file` có thể trỏ đến `pairs.json` của run trước để giữ cặp qua nhiều seed;
@@ -70,9 +105,11 @@ support từng lớp, trung bình score rồi xếp cặp. Best pilot checkpoint
 khởi tạo main có thể thuộc một epoch khác; hai lựa chọn này được ghi riêng.
 Thứ hạng ổn định không đồng nghĩa đã tìm đúng các cặp khó nhất sau main.
 
-Chọn `CFG.update(image_size=224)` sau khi áp dụng preset nếu muốn kiểm tra riêng
-độ phân giải; mặc định 112. Resize không sinh chi tiết mới. So accuracy và thời
-gian với cùng các yếu tố còn lại, không đồng thời thêm nhánh/loss.
+Preset ghi tường minh resolution/head/MixUp. Nếu muốn tự chỉnh, đặt
+`CFG.update(...)` sau `CFG.update(EXPERIMENT_PRESETS[EXPERIMENT])`, ví dụ
+`CFG.update(mixup_probability=0.5)` sau khi đã chọn head/resolution bằng validation.
+Giữ cùng split, seed, lịch train và chế độ GPU khi so; nếu giảm batch vì hết VRAM
+ở 224, phải ghi rõ điều kiện đó khi báo cáo.
 
 ## Tốc độ đọc/decode ảnh và tái dùng cache
 
@@ -142,9 +179,10 @@ with torch.inference_mode():
 ```
 
 Đầu vào phải là ảnh grayscale lặp 3 kênh, kích thước khớp checkpoint (mặc định
-112×112, có thể thử 224×224), chuẩn hóa ImageNet. Loader vẫn đọc checkpoint cũ
-không có `image_size` và mặc định chúng là 112. Các weights này chưa dùng trực
-tiếp với ứng dụng CCT cũ trong `src/fer`.
+mới 224×224), chuẩn hóa ImageNet. Checkpoint lưu `head_type` và `image_size` để
+nạp đúng classifier và resolution, không tải ImageNet khi inference. Loader vẫn
+đọc checkpoint cũ thiếu `image_size`/`head_type`, mặc định chúng là 112/linear.
+Các weights này chưa dùng trực tiếp với ứng dụng CCT cũ trong `src/fer`.
 
 ## Kiểm tra local
 
@@ -158,6 +196,12 @@ Kiểm tra cache gồm hàng đợi không bị chặn bởi file chậm, pixel/
 giống nguồn, bản PIL độc lập, pack disk/RAM reuse không decode lại nguồn,
 cache hỏng được dựng lại, budget/fallback và đóng thread khi lỗi/dừng sớm.
 Không phải kết quả accuracy FER2013; CUDA/AMP thực tế cần chạy trên Kaggle.
+Kiểm tra bổ sung: weights lớp ẩn pretrained không bị reset, pilot/main giữ
+projection, optimizer cho projection vào nhóm LR thấp; metadata round-trip và
+backward ở cả 112/224. Chạy trọn notebook cho mặc định 224/linear và cấu hình
+224/head có lớp ẩn/MixUp 0,5, kiểm tra riêng threshold MixUp 0,5 và accuracy
+hai nhãn. Local dùng weights fixture ngẫu nhiên, không tải ImageNet hay tuyên
+bố đo accuracy thực tế.
 
 Để chạy lại kiểm tra từ môi trường có thư viện của dự án:
 

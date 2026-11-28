@@ -41,12 +41,23 @@ for index, cell in enumerate(nb.cells):
         exec(compile(ast.Module(body=defs, type_ignores=[]), f'definitions_{index}', 'exec'), ns)
 
 cfg = copy.deepcopy(ns['CFG'])
-assert cfg['experiment'] == 'global_ce' and cfg['num_pairs'] == 3
+assert cfg['experiment'] == 'global_ce_224' and cfg['num_pairs'] == 3
+assert cfg['image_size'] == 224 and cfg['head_type'] == 'linear' and cfg['mixup_probability'] == .3
 assert not cfg['use_pair_correction'] and not cfg['balanced_loss']
 assert cfg['backbone_lr'] == 1e-4 and cfg['pair_mining_window'] == 3
 assert cfg['pilot_epochs'] == 15 and cfg['main_epochs'] == 35
 assert ns['EXPERIMENT_PRESETS']['global_ce_lr3e5']['backbone_lr'] == 3e-5
 assert cfg['pilot_epochs'] + cfg['main_epochs'] == 50
+assert ns['tqdm'].__module__ == 'tqdm.std'
+baseline_preset=ns['EXPERIMENT_PRESETS']['global_ce']
+assert {k for k in baseline_preset if baseline_preset[k]!=ns['EXPERIMENT_PRESETS']['global_ce_224'][k]}=={'image_size'}
+assert {k for k in baseline_preset if baseline_preset[k]!=ns['EXPERIMENT_PRESETS']['global_ce_pretrained_head'][k]}=={'head_type'}
+assert {k for k in baseline_preset if baseline_preset[k]!=ns['EXPERIMENT_PRESETS']['global_ce_mixup50'][k]}=={'mixup_probability'}
+for preset in ns['EXPERIMENT_PRESETS'].values():
+    ns['validate_config']({**cfg,**preset})
+try:ns['validate_config']({**cfg,'head_type':'unsupported'})
+except ValueError:pass
+else:raise AssertionError('Unknown classifier type accepted.')
 cfg.update(ns['EXPERIMENT_PRESETS']['pair_balanced'])
 cfg.update(experiment='pair_balanced', run_name='smoke_pair_balanced')
 cfg.update(pretrained=False, device='cpu', batch_size=7, pilot_epochs=2, main_epochs=3,
@@ -143,6 +154,7 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
     with torch.inference_mode(): torch.testing.assert_close(restored(sample)['logits'],expected)
     legacy = copy.deepcopy(payload)
     legacy['model_config'].pop('image_size')
+    legacy['model_config'].pop('head_type')
     torch.save(legacy,folder/'legacy112.pth')
     legacy_restored = ns['load_trained_model'](folder/'legacy112.pth',device)
     with torch.inference_mode(): torch.testing.assert_close(legacy_restored(sample)['logits'],expected)
@@ -183,6 +195,73 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
     random2,_,_=ns['choose_pairs']({**cfg,'pair_selection':'random'},val,'abc')
     assert random1['pairs']==random2['pairs']
     assert ns['choose_pairs']({**cfg,'use_pair_correction':False},val,'abc')[0]['pairs']==[]
+
+    # Pretrained hidden layer must be reused exactly, not reinitialized as a new head.
+    # Use a deterministic local torchvision state dict as a network-free ImageNet-file fixture.
+    fixture_backbone=ns['models'].mobilenet_v3_small(weights=None)
+    with torch.no_grad():
+        fixture_backbone.classifier[0].weight.fill_(.0123)
+        fixture_backbone.classifier[0].bias.fill_(.0045)
+    backbone_path=folder/'mobilenet_fixture.pth'
+    torch.save(fixture_backbone.state_dict(),backbone_path)
+    hidden_cfg={**cfg,'head_type':'pretrained_mlp','pretrained':True,'backbone_weights_path':str(backbone_path)}
+    hidden=ns['build_model'](hidden_cfg,[],pretrained=True).eval()
+    assert sum(p.numel() for p in hidden.parameters())==1525031
+    assert hidden.global_classifier.in_features==1024
+    assert sum(p.numel() for p in hidden.global_projection.parameters())==590848
+    torch.testing.assert_close(hidden.global_projection[0].weight,fixture_backbone.classifier[0].weight,atol=0,rtol=0)
+    torch.testing.assert_close(hidden.global_projection[0].bias,fixture_backbone.classifier[0].bias,atol=0,rtol=0)
+    # Also check the online weights argument without accessing the network.
+    with patch.object(ns['models'],'mobilenet_v3_small',return_value=fixture_backbone) as constructor:
+        online=ns['build_model']({**hidden_cfg,'backbone_weights_path':None},[],pretrained=True)
+    constructor.assert_called_once_with(weights=ns['models'].MobileNet_V3_Small_Weights.IMAGENET1K_V1)
+    torch.testing.assert_close(online.global_projection[0].weight,hidden.global_projection[0].weight)
+    transferred=ns['build_model'](hidden_cfg,pairs,pretrained=False)
+    assert sum(p.numel() for p in transferred.parameters())==1527789
+    with torch.no_grad():
+        hidden.global_projection[0].bias.add_(.03)
+        hidden.global_classifier.bias.add_(.04)
+    ns['transfer_global_state'](hidden,transferred)
+    for part in ('features','global_projection','global_classifier'):
+        first=getattr(hidden,part).state_dict();second=getattr(transferred,part).state_dict()
+        assert first.keys()==second.keys()
+        assert all(torch.equal(value,second[key]) for key,value in first.items())
+    hidden_optimizer,_=ns['build_optimizer'](nn.DataParallel(transferred),hidden_cfg,'main')
+    low_lr={id(p) for p in hidden_optimizer.param_groups[0]['params']}
+    high_lr={id(p) for p in hidden_optimizer.param_groups[1]['params']}
+    assert not low_lr & high_lr
+    assert low_lr | high_lr == {id(p) for p in transferred.parameters()}
+    assert all(id(p) in low_lr for p in transferred.global_projection.parameters())
+    assert all(id(p) in high_lr for p in transferred.global_classifier.parameters())
+    assert all(id(p) in high_lr for p in transferred.local_projection.parameters())
+    for image_size in (112,224):
+        candidate_cfg={**hidden_cfg,'image_size':image_size}
+        candidate=ns['build_model'](candidate_cfg,pairs,pretrained=False)
+        pilot=ns['build_model'](candidate_cfg,[],pretrained=False)
+        ns['transfer_global_state'](pilot,candidate)
+        candidate.train()
+        batch=torch.randn(2,3,image_size,image_size)
+        result=candidate(batch)
+        assert result['logits'].shape==(2,7)
+        gradient_loss=ns['PairTrainingLoss'](counts,pairs,candidate_cfg,balanced=True)(result,torch.tensor([2,5]))[0]
+        gradient_loss.backward()
+        assert candidate.global_projection[0].weight.grad is not None
+        assert candidate.global_projection[0].weight.grad.abs().sum()>0
+        assert torch.isfinite(candidate.global_projection[0].weight.grad).all()
+        candidate.eval()
+        with torch.inference_mode():expected_hidden=candidate(batch)['logits']
+        filename=folder/f'hidden_{image_size}.pth'
+        ns['save_checkpoint'](candidate,candidate_cfg,1,{'loss':1.,'accuracy':.6,'macro_f1':.5,'balanced_accuracy':.5},filename)
+        with patch.object(ns['models'],'mobilenet_v3_small',wraps=ns['models'].mobilenet_v3_small) as constructor:
+            from_saved=ns['load_trained_model'](filename,device)
+        constructor.assert_called_once_with(weights=None)
+        assert from_saved.head_type=='pretrained_mlp' and from_saved.image_size==image_size
+        with torch.inference_mode():torch.testing.assert_close(from_saved(batch)['logits'],expected_hidden)
+        wrong_head=ns['build_model']({**candidate_cfg,'head_type':'linear'},[],pretrained=False)
+        try:ns['transfer_global_state'](wrong_head,candidate)
+        except ValueError:pass
+        else:raise AssertionError('Mismatched pilot/main head type accepted.')
+    print('PASS: pretrained hidden weights preserved, exact pilot transfer, low-LR optimizer group, 112/224 backward and metadata checkpoints.')
 
     # Old/early confusion must not influence ranking of the last two snapshots.
     early=np.eye(7,dtype=int)*10;early[0,0]=0;early[0,1]=10;early[1,1]=0;early[1,0]=10
@@ -394,11 +473,11 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
         assert (run_dir/artifact).is_file(),artifact
     print('PASS: entire notebook executed in order, 2 pilot + 3 main epochs, frozen validation-mined pairs, strict pilot transfer, reports and test.')
 
-    # Default global_ce must finish Run All without consulting a test directory.
+    # Default global_ce_224 must finish Run All with its actual resolution and no test directory.
     (root/'test').rename(root/'held_out_again')
     default_run={'__name__':'__default_global_ce_smoke__'}
-    default_cfg={**cfg,**ns['EXPERIMENT_PRESETS']['global_ce'],
-                 'experiment':'global_ce','run_name':'smoke_global_ce',
+    default_cfg={**cfg,**ns['EXPERIMENT_PRESETS']['global_ce_224'],
+                 'experiment':'global_ce_224','run_name':'smoke_global_ce_224',
                  'main_epochs':2,'main_warmup_epochs':0}
     with patch('matplotlib.pyplot.show'):
         for i,cell in enumerate(nb.cells):
@@ -410,13 +489,62 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
                 default_run['CFG']['output_root']=str(folder/'default_outputs')
                 default_run['DEVICE']=device
     assert default_run['PAIRS']==[] and len(default_run['pilot_history'])==2
+    assert default_run['model'].image_size==224
+    default_metadata=json.loads((default_run['RUN_DIR']/'training.json').read_text())
+    assert default_metadata['model_config']['image_size']==224 and default_metadata['model_config']['head_type']=='linear'
     assert len(default_run['history'])==2 and (default_run['history'].pair_loss==0).all()
     assert 'test_result' not in default_run
     assert not (default_run['RUN_DIR']/'test_metrics.json').exists()
     default_predictions=pd.read_csv(default_run['RUN_DIR']/'validation_predictions.csv')
     assert (default_predictions.prediction==default_predictions.global_prediction).all()
     assert pd.read_csv(default_run['RUN_DIR']/'validation_pair_diagnostics.csv').empty
-    print('PASS: default global_ce Run All completes without any test directory, produces no test output and needs no pair branch.')
+    print('PASS: default global_ce_224 Run All completes at 224 with no test directory and no pair branch.')
+
+    # Combined option exercises real pilot/main training at 224 with the retained head,
+    # and probability .5 (the numeric MixUp labels are checked below).
+    option_cfg={**cfg,**ns['EXPERIMENT_PRESETS']['global_ce_224_pretrained_head_mixup50'],
+                'experiment':'global_ce_224_pretrained_head_mixup50','run_name':'smoke_hidden224_mixup50',
+                'pilot_epochs':1,'main_epochs':1,'pilot_warmup_epochs':0,'main_warmup_epochs':0,
+                'pair_mining_window':1}
+    assert option_cfg['mixup_probability']==.5
+    option_run={'__name__':'__hidden224_run_all__'}
+    with patch('matplotlib.pyplot.show'):
+        for i,cell in enumerate(nb.cells):
+            if cell.cell_type!='code':continue
+            exec(compile(cell.source,f'hidden224_cell_{i}','exec'),option_run)
+            if 'configuration' in cell.metadata.get('tags',[]):
+                option_run['CFG'].update(option_cfg)
+                option_run['CFG']['data_dir']=str(root)
+                option_run['CFG']['output_root']=str(folder/'hidden_outputs')
+                option_run['DEVICE']=device
+    assert option_run['model'].image_size==224 and option_run['model'].head_type=='pretrained_mlp'
+    assert option_run['history'].train_loss.notna().all()
+    option_meta=json.loads((option_run['RUN_DIR']/'training.json').read_text())
+    assert option_meta['parameter_count']==1525031 and option_meta['retained_projection_parameters']==590848
+    assert not option_meta['retained_projection_initialized_from_imagenet']  # Random local smoke fixture, not a claim of pretraining.
+    assert option_meta['config']['mixup_probability']==.5
+    assert 'test_result' not in option_run
+    print('PASS: combined 224 + retained-head + MixUp .5 Run All, strict phase transfer and full artifact export.')
+
+    # Verify MixUp .5 gate takes mixed/unmixed branches on either side of threshold.
+    class MixToy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc=nn.Linear(1,7,bias=False)
+            with torch.no_grad():self.fc.weight.zero_();self.fc.weight[0,0]=-4;self.fc.weight[1,0]=4
+        def forward(self,x):
+            z=self.fc(x)
+            return {'logits':z,'global_logits':z,'pair_logits':z.new_zeros((len(x),0)),'gates':z.new_zeros((len(x),0))}
+    toy=MixToy();toy_optimizer=torch.optim.SGD(toy.parameters(),lr=0)
+    toy_criterion=ns['PairTrainingLoss']([3]*7,[],option_cfg,False)
+    toy_loader=[(torch.tensor([[-1.],[1.]]),torch.tensor([0,1]))]
+    for coin,expected_accuracy,should_mix in [(.4,.75,True),(.6,1.0,False)]:
+        with patch('numpy.random.random',return_value=coin),patch('numpy.random.beta',return_value=.25) as beta, \
+             patch('torch.randperm',return_value=torch.tensor([1,0])):
+            outcome=ns['train_one_epoch'](toy,toy_loader,toy_optimizer,torch.amp.GradScaler('cuda',enabled=False),
+                toy_criterion,device,option_cfg,'main',1)
+        assert outcome['accuracy']==expected_accuracy and beta.called==should_mix
+    print('PASS: MixUp probability .5 activates only selected batches and preserves weighted two-label accuracy.')
 
     # A global-only run must use no auxiliary branch and no pair-loss terms.
     global_cfg={**cfg,**ns['EXPERIMENT_PRESETS']['global_balanced'],'main_epochs':2,'main_warmup_epochs':0}
