@@ -9,6 +9,6 @@ notebook, with a ResNet18 tokenizer, 49 positional tokens, embedding dimension
 512, four Transformer encoder layers, eight attention heads and seven classes.
 Class order: angry, disgust, fear, happy, neutral, sad, surprise.
 
-No model weights are downloaded automatically. To obtain a checkpoint, train
-with `compact-convolutional-transformers-cct.ipynb`, or use a compatible checkpoint you already
-have. A fresh clone needs this file before running inference.
+Use the [local CCT training notebook](../notebooks/cct/fer2013-cct-resnet18-local.ipynb)
+to train a checkpoint, or supply compatible weights before running inference.
+Local checkpoints from the CCT + CBAM experiment live in `models/cct-cbam/`.

@@ -214,7 +214,7 @@ bố đo accuracy thực tế.
 Để chạy lại kiểm tra từ môi trường có thư viện của dự án:
 
 ```powershell
-.\.venv\Scripts\python.exe Notebook/PairCorrection/verify_notebook.py
+.\.venv\Scripts\python.exe notebooks/pair-correction/verify_notebook.py
 ```
 
 Script kiểm tra dùng dữ liệu tạm, không tải weights, không sửa các notebook khác.

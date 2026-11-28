@@ -21,10 +21,14 @@ import torch
 from torch import nn
 
 
-WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+NOTEBOOK_DIR = Path(__file__).resolve().parent
+WORKSPACE_ROOT = NOTEBOOK_DIR.parents[1]
 os.chdir(WORKSPACE_ROOT)
-path = Path('Notebook/PairCorrection/fer2013-pair-correction-kaggle.ipynb')
-protected = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in Path('Notebook').rglob('*.ipynb') if p != path}
+path = NOTEBOOK_DIR / 'fer2013-pair-correction-kaggle.ipynb'
+protected = {
+    p: hashlib.sha256(p.read_bytes()).hexdigest()
+    for p in NOTEBOOK_DIR.parent.rglob('*.ipynb') if p != path
+}
 nb = nbformat.read(path, as_version=4)
 nbformat.validate(nb)
 ns = {'__name__': '__pair_notebook_smoke__'}

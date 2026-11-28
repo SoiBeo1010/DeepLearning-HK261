@@ -4,24 +4,36 @@ Nhận diện cảm xúc khuôn mặt (FER2013) bằng **ResNet18 + Compact Conv
 Transformer (CCT)**. Dự án có notebook huấn luyện, module Python dùng chung và
 ứng dụng nhận diện qua webcam hoặc ảnh.
 
+Xem [tài liệu kiến trúc model](docs/model-architecture.md) để biết luồng dữ liệu,
+cấu trúc từng khối, số tham số, cấu hình huấn luyện và các giới hạn hiện tại.
+
 ## Cấu trúc
 
 ```text
 DL/
-├── compact-convolutional-transformers-cct.ipynb  # Huấn luyện, biểu đồ, đánh giá
-├── main.py                                     # Chạy webcam / ảnh
-├── src/fer/
-│   ├── config.py                              # Nhãn, kích thước ảnh, cấu hình
-│   ├── model.py                               # ResNet18, Transformer, SeqPool
-│   ├── predictor.py                           # Load checkpoint, tiền xử lý
-│   ├── app.py                                 # CLI, camera, đọc/ghi ảnh
-│   └── training.py                            # DataLoader, loss, train/evaluate
-├── models/                                    # Checkpoint cục bộ, không commit
-├── tests/                                     # Kiểm thử không cần webcam
+├── main.py                    # CLI webcam / ảnh
+├── src/fer/                   # Model, inference và pipeline huấn luyện CCT
+├── notebooks/
+│   ├── cct/                   # CCT + ResNet18, bản local và Kaggle
+│   ├── custom-cnn/            # CNN tự thiết kế, bản Kaggle
+│   └── pair-correction/       # MobileNetV3, bản Kaggle và script kiểm tra
+├── docs/                      # Tài liệu kiến trúc
+├── models/                    # Checkpoint cục bộ
+├── outputs/                   # Kết quả và báo cáo của các run cục bộ
+├── tests/                     # Kiểm thử inference và training
 ├── pyproject.toml
-├── requirements.txt                           # Thư viện inference đã kiểm tra
-└── requirements-notebook.txt                   # Thư viện huấn luyện + Jupyter
+├── requirements.txt
+└── requirements-notebook.txt
 ```
+
+Mỗi nhóm notebook có thư mục `results/` khi có bản đã chạy lưu kèm output.
+Báo cáo cục bộ trong `outputs/analysis/` được chia theo cùng ba nhóm.
+
+| Nhóm | Notebook chạy mới |
+|---|---|
+| CCT + ResNet18 | [Local](notebooks/cct/fer2013-cct-resnet18-local.ipynb) · [Kaggle](notebooks/cct/fer2013-cct-resnet18-kaggle.ipynb) |
+| Custom CNN | [Kaggle](notebooks/custom-cnn/fer2013-custom-cnn-kaggle.ipynb) |
+| Pair Correction | [Kaggle](notebooks/pair-correction/fer2013-pair-correction-kaggle.ipynb) · [Hướng dẫn](notebooks/pair-correction/README.md) |
 
 ## Cài đặt
 
@@ -103,8 +115,8 @@ Lệnh mặc định train 50 epochs, batch 64; có thể giảm batch nếu thi
 .\.venv\Scripts\python.exe -m jupyterlab
 ```
 
-Notebook dùng `FER_DATA_DIR` nếu biến môi trường này được đặt, mặc định là
-`data/fer2013`. Đổi `TrainConfig` trong notebook để chỉnh learning rate,
+Notebook CCT chạy local dùng `FER_DATA_DIR` nếu biến môi trường này được đặt,
+mặc định là `data/fer2013` tính từ gốc repo. Đổi `TrainConfig` để chỉnh learning rate,
 validation fraction, curriculum hoặc seed. Trên Windows/notebook giữ
 `num_workers=0`; CLI có thể chỉnh `--num-workers`.
 
