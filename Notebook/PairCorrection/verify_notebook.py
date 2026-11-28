@@ -7,7 +7,8 @@ import os
 from pathlib import Path
 import sys
 import tempfile
-from unittest.mock import patch
+import threading
+from unittest.mock import Mock, patch
 
 os.environ['MPLBACKEND'] = 'Agg'
 sys.stdout.reconfigure(encoding='utf-8')
@@ -252,8 +253,86 @@ with tempfile.TemporaryDirectory(prefix='fer-pair-notebook-smoke-') as directory
             for i in range(count):
                 image=np.random.default_rng(label_id*10+i).integers(0,256,(48,48),dtype=np.uint8)
                 Image.fromarray(image).save(target/f'{i}.png')
+    cfg['cache_dir']=str(folder/'cache_packs')
+    # Threaded decode must not block replenishment on a slow first item.
+    expected_arrays={str(i):np.full((2,2,3),i,dtype=np.uint8) for i in range(8)}
+    reached_later=threading.Event()
+    def delayed_decode(path):
+        if path=='0':
+            assert reached_later.wait(timeout=3),'Slow first item blocked queue replenishment.'
+        if path=='4':reached_later.set()
+        return expected_arrays[path].copy()
+    with patch.dict(ns['iter_decoded_images'].__globals__,decode_rgb_array=delayed_decode):
+        decoded=dict(ns['iter_decoded_images'](list(expected_arrays),2))
+    assert reached_later.is_set() and set(decoded)==set(expected_arrays)
+    for key in decoded:np.testing.assert_array_equal(decoded[key],expected_arrays[key])
+    print('PASS: bounded rolling queue keeps reading beyond a slow first file.')
+
+    image_paths=sorted(str(p.resolve()) for p in (root/'train').rglob('*.png'))
+    cache_signature=ns['image_cache_signature'](image_paths,cfg)
+    pack_path=folder/'standalone_cache.npz'
+    cache=ns['CachedImageLoader'](image_paths,256,workers=4,cache_path=pack_path,signature=cache_signature)
+    assert len(cache.images)==28 and cache.used_bytes==28*48*48*3 and pack_path.is_file()
+    expected=np.asarray(ns['datasets'].folder.default_loader(image_paths[0])).copy()
+    first=cache(image_paths[0]);first.putpixel((0,0),(0,0,0))
+    np.testing.assert_array_equal(np.asarray(cache(image_paths[0])),expected)
+    with patch.object(ns['datasets'].folder,'default_loader',side_effect=AssertionError('Disk pack must avoid source decode')):
+        disk_cache=ns['CachedImageLoader'](image_paths,256,workers=4,cache_path=pack_path,signature=cache_signature)
+        assert len(disk_cache.images)==28
+        for key in image_paths:np.testing.assert_array_equal(np.asarray(disk_cache(key)),cache.images[key])
+    # Cache must not store augmentation: fixed seed gives identical transformed input.
+    augmentation=ns['build_transforms'](cfg,training=True)
+    ns['seed_everything'](42);original_tensor=augmentation(ns['datasets'].folder.default_loader(image_paths[0]))
+    ns['seed_everything'](42);cached_tensor=augmentation(disk_cache(image_paths[0]))
+    torch.testing.assert_close(original_tensor,cached_tensor,atol=0,rtol=0)
+    with np.load(pack_path,allow_pickle=False) as packed:
+        values={key:packed[key] for key in packed.files}
+    values['indices']=values['indices'].copy();values['indices'][0]=len(image_paths)+1
+    with pack_path.open('wb') as handle:np.savez(handle,**values)
+    repaired=ns['CachedImageLoader'](image_paths,256,workers=4,cache_path=pack_path,signature=cache_signature)
+    assert len(repaired.images)==28
+    limited=ns['CachedImageLoader'](image_paths,48*48*3/1024**2,workers=2)
+    assert len(limited.images)==1 and limited.used_bytes==48*48*3
+    missed=next(p for p in image_paths if p not in limited.images)
+    np.testing.assert_array_equal(np.asarray(limited(missed)),np.asarray(ns['datasets'].folder.default_loader(missed)))
+    try:ns['CachedImageLoader']([str(root/'missing.png')],256,workers=2)
+    except FileNotFoundError:pass
+    else:raise AssertionError('Source-image errors must propagate.')
+    assert not any(t.name.startswith('ThreadPoolExecutor-') for t in threading.enumerate())
+    print('PASS: exact RGB pixels, independent PIL copies, seeded transform identity, safe disk-pack round trip, corruption rebuild and bounded fallback.')
+
     (root/'test').rename(root/'held_out')
     loaders,manifest,summary=ns['build_data'](cfg,root,device)
+    ram_cache=loaders['train'].dataset.dataset.loader
+    with patch.object(ns['datasets'].folder,'default_loader',side_effect=AssertionError('RAM reuse must not decode sources')):
+        repeated_loaders,repeated_manifest,_=ns['build_data'](cfg,root,device)
+    assert repeated_loaders['train'].dataset.dataset.loader is ram_cache
+    assert repeated_manifest.equals(manifest)
+    # Re-executing the definitions cell must preserve the session registry.
+    data_source=next(c.source for c in nb.cells if 'data_functions' in c.metadata.get('tags',[]))
+    saved_registry=ns['IMAGE_CACHE_REGISTRY']
+    exec(data_source,ns)
+    assert ns['IMAGE_CACHE_REGISTRY'] is saved_registry
+    ns['IMAGE_CACHE_REGISTRY'].clear()
+    with patch.object(ns['datasets'].folder,'default_loader',side_effect=AssertionError('Reload from pack must not decode sources')):
+        packed_loaders,packed_manifest,_=ns['build_data'](cfg,root,device)
+    assert packed_manifest.equals(manifest)
+    assert packed_loaders['train'].dataset.dataset.loader is not ram_cache
+    assert ns['image_cache_signature'](image_paths,{**cfg,'cache_revision':'changed'})!=cache_signature
+    assert ns['image_cache_signature'](image_paths,{**cfg,'cache_workers':1})==cache_signature
+    original_decoder=ns['decode_rgb_array']
+    with patch.dict(ns['iter_decoded_images'].__globals__,decode_rgb_array=Mock(wraps=original_decoder)):
+        fresh_loaders,_,_=ns['build_data']({**cfg,'cache_reuse':False},root,device)
+        assert ns['decode_rgb_array'].call_count==28
+    assert fresh_loaders['train'].dataset.dataset.loader is not ram_cache
+    assert not any(str(root/'test') in p for p in ram_cache.images)
+    broken_pack=folder/'broken_zip.npz'
+    broken_pack.write_bytes(b'not a numpy pack')
+    rebuilt=ns['CachedImageLoader'](image_paths,256,workers=2,cache_path=broken_pack,signature=cache_signature)
+    assert len(rebuilt.images)==28
+    with patch.object(ns['datasets'].folder,'default_loader',side_effect=AssertionError('Rebuilt pack should be reusable')):
+        ns['CachedImageLoader'](image_paths,256,workers=2,cache_path=broken_pack,signature=cache_signature)
+    print('PASS: same-session RAM reuse, registry survives cell reruns, pack reload avoids source I/O, revision invalidates and reuse=False rebuilds.')
     other,other_manifest,_=ns['build_data']({**cfg,'seed':43},root,device)
     assert manifest.equals(other_manifest)
     assert len(loaders['train'].dataset)==21 and len(loaders['val'].dataset)==7

@@ -74,6 +74,38 @@ Chọn `CFG.update(image_size=224)` sau khi áp dụng preset nếu muốn kiể
 độ phân giải; mặc định 112. Resize không sinh chi tiết mới. So accuracy và thời
 gian với cùng các yếu tố còn lại, không đồng thời thêm nhánh/loss.
 
+## Tốc độ đọc/decode ảnh và tái dùng cache
+
+Lần đầu vẫn phải mở/decode ảnh nguồn. Mặc định `cache_workers=8` dùng hàng đợi
+liên tục, tối đa 16 công việc pending, thay vì chờ hết từng nhóm file. Các luồng
+này chỉ đọc ảnh RGB gốc, không thực hiện augmentation hoặc tạo tiến trình con.
+Có thể thử 4/8/16 luồng theo tốc độ thực tế của mount; nhiều luồng hơn không
+đảm bảo tăng tốc tương ứng. Thanh tiến độ là thời gian cả đọc file và decode,
+không chỉ CPU decode. GPU không thực hiện bước này.
+
+- **Chạy lại cell trong cùng kernel:** `cache_reuse=True` giữ cache trong RAM;
+  log in `Reusing RAM cache`, không decode ảnh nguồn lại.
+- **RAM đã mất nhưng file còn:** `cache_disk=True` lưu pack `.npz` không nén
+  dưới `/kaggle/working/.fer_image_cache`, log in `Cache loaded from disk` khi
+  có thể dùng lại. Một file pack giúp tránh mở lại hàng chục nghìn file nhỏ.
+- **Kaggle xóa session/working storage:** cả RAM và file cache có thể mất, lúc
+  đó vẫn phải tạo lại. Cache pack không phải weights hay checkpoint.
+
+Cache lưu RGB uint8 nguyên kích thước, giữ nguyên pixel. Loader trả PIL mới cho
+transform mỗi lần, nên augmentation không bị đóng băng và không làm hỏng cache.
+`cache_max_mib=256` giới hạn pixel đã lưu; ảnh còn lại đọc từ nguồn. Bộ nhớ tạm
+khi pack/nạp và overhead object không nằm trong giới hạn pixel này.
+
+Khóa cache gồm toàn bộ danh sách đường dẫn, budget, format và `cache_revision`.
+Không stat/hash nội dung từng ảnh khi reuse để tránh lại bị chậm trên mount.
+Nếu chỉnh nội dung ảnh nhưng giữ tên, tăng `cache_revision` hoặc đặt
+`cache_reuse=False` để buộc tạo mới. Đặt `cache_disk=False` nếu chỉ muốn cache
+RAM; đặt `cache_images=False` để tắt cache hoàn toàn (train lại phải đọc nguồn).
+
+NPZ được nạp với `allow_pickle=False`, kiểm tra index/shape/pixel budget và ghi
+atomic qua file tạm. Pack lỗi được dựng lại từ ảnh nguồn. Các cải tiến không đổi
+split, model hoặc input sau transform; chưa đo mức tăng tốc trên Kaggle.
+
 ## File kết quả
 
 - `run_config.json`, `training.json`, `model_config.json`: cấu hình thực chạy.
@@ -122,6 +154,9 @@ Kiểm tra ranking theo cửa sổ qua nhiều epoch, hỗ trợ snapshot cùng 
 gate/delta trên fixture có helpful/harmful biết trước, và toàn bộ notebook với
 dữ liệu giả: 2 epoch pilot + 3 epoch chính trên CPU; thêm run global-only theo
 mặc định mới với test bị giữ ngoài filesystem. Test không được đọc khi bị tắt.
+Kiểm tra cache gồm hàng đợi không bị chặn bởi file chậm, pixel/augmentation
+giống nguồn, bản PIL độc lập, pack disk/RAM reuse không decode lại nguồn,
+cache hỏng được dựng lại, budget/fallback và đóng thread khi lỗi/dừng sớm.
 Không phải kết quả accuracy FER2013; CUDA/AMP thực tế cần chạy trên Kaggle.
 
 Để chạy lại kiểm tra từ môi trường có thư viện của dự án:
