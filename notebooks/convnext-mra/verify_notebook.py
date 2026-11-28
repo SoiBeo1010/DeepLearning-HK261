@@ -116,6 +116,11 @@ assert ema.updates == 1
 
 t_opt = ns['fit_temperature'](torch.randn(50, 7) * 2.0, torch.randint(0, 7, (50,)))
 assert 0.05 <= t_opt <= 10.0
+with torch.inference_mode():
+    inf_logits = torch.randn(50, 7) * 2.0
+    inf_targets = torch.randint(0, 7, (50,))
+t_opt_inf = ns['fit_temperature'](inf_logits, inf_targets)
+assert 0.05 <= t_opt_inf <= 10.0
 m_cal = ns['compute_metrics_from_logits'](torch.randn(50, 7), torch.randint(0, 7, (50,)))
 assert set(m_cal) == {'nll', 'ece', 'accuracy', 'macro_f1', 'balanced_accuracy', 'composite'}
 assert 0.0 <= m_cal['ece'] <= 1.0
